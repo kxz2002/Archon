@@ -1,0 +1,274 @@
+name: archon-distill-from-history
+description: |
+  Use when: User wants to extract a reusable Archon workflow from a past CC session.
+  Triggers: "distill from history", "extract workflow from cc session",
+            "crystallize from conversation", "mine conversation history",
+            "build workflow from past sessions", "history to workflow",
+            "distill this workflow", "learn from cc history".
+  Does: Loads CC JSONL session log -> extracts structured tool call trace and
+        reasoning content -> analyzes generalizable workflow intent ->
+        generates workflow YAML -> presents for human review and approval ->
+        validates locally with retry loop -> saves to .archon/workflows/.
+  NOT for: Creating workflows from scratch descriptions (use archon-workflow-builder).
+           Non-CC conversation histories. Editing existing workflows.
+
+  Optional: pass a session UUID or full JSONL path as $ARGUMENTS.
+  If omitted, auto-detects the most recent CC session for the current project.
+
+nodes:
+  # ─────────────────────────────────────────────────────────────────────
+  # 节点 1：加载 CC 会话数据（参考 issue #976 load-run-data 模式）
+  # 集中提取结构化数据，所有下游节点统一消费此输出
+  # ─────────────────────────────────────────────────────────────────────
+  - id: load-session-data
+    bash: |
+      set -e
+
+      # ── 1. 发现 JSONL 路径 ──────────────────────────────────────────
+      PROJECT_KEY=$(echo "$PWD" | sed 's|^/||' | tr '/' '-')
+      PROJECTS_DIR="$HOME/.claude/projects/-$PROJECT_KEY"
+
+      if [ -n "$ARGUMENTS" ] && [ "$ARGUMENTS" != "" ]; then
+        if [ -f "$ARGUMENTS" ]; then
+          SESSION_PATH="$ARGUMENTS"
+        elif [ -f "$PROJECTS_DIR/$ARGUMENTS.jsonl" ]; then
+          SESSION_PATH="$PROJECTS_DIR/$ARGUMENTS.jsonl"
+        else
+          echo '{"error": "session not found", "stats": {"complexity": "low"}, "user_goals": [], "tool_trace": [], "parallel_groups": []}'
+          exit 0
+        fi
+      else
+        if [ ! -d "$PROJECTS_DIR" ]; then
+          echo '{"error": "no cc sessions for this project", "stats": {"complexity": "low"}, "user_goals": [], "tool_trace": [], "parallel_groups": []}'
+          exit 0
+        fi
+        SESSION_PATH=$(ls -t "$PROJECTS_DIR"/*.jsonl 2>/dev/null | head -1)
+        if [ -z "$SESSION_PATH" ]; then
+          echo '{"error": "no jsonl files found", "stats": {"complexity": "low"}, "user_goals": [], "tool_trace": [], "parallel_groups": []}'
+          exit 0
+        fi
+      fi
+
+      SESSION_UUID=$(basename "$SESSION_PATH" .jsonl)
+      SUBAGENTS_DIR="$PROJECTS_DIR/$SESSION_UUID/subagents"
+
+      # ── 2. Python 提取并结构化 JSONL ────────────────────────────────
+      python3 - "$SESSION_PATH" "$SUBAGENTS_DIR" <<'PYEOF'
+      import sys, json, os
+
+      session_path = sys.argv[1]
+      subagents_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+      session_uuid = os.path.basename(session_path).replace('.jsonl', '')
+
+      # v2: 补上 last-prompt
+      NOISE_TYPES = {'file-history-snapshot', 'permission-mode', 'attachment',
+                     'system', 'last-prompt'}
+      MAX_TOOL_CALLS = 80
+      TARGET_TOOL_CALLS = 60
+      TRUNC = {'bash_cmd': 300, 'prompt': 200, 'result': 200,
+               'thinking': 300, 'assistant_text': 150, 'user_text': 400}
+
+      raw_records = []
+      with open(session_path, encoding='utf-8', errors='strict') as f:
+          for line in f:
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  raw_records.append(json.loads(line))
+              except Exception:
+                  pass  # 跳过格式错误行
+
+      total_raw = len(raw_records)
+
+      # 第一遍：收集有效消息
+      valid = []
+      for r in raw_records:
+          if r.get('type') in NOISE_TYPES:
+              continue
+          if r.get('type') not in ('user', 'assistant'):
+              continue
+          if r.get('isSidechain', False):
+              continue
+          msg = r.get('message', {})
+          content = msg.get('content', '')
+
+          if r['type'] == 'assistant' and isinstance(content, list):
+              tool_calls = [c for c in content if c.get('type') == 'tool_use']
+              if not tool_calls:
+                  text = next((c.get('text', '') for c in content if c.get('type') == 'text'), '')
+                  if len(text.strip()) < 20:
+                      continue
+              valid.append(r)
+          elif r['type'] == 'user':
+              if isinstance(content, str):
+                  if content.strip():
+                      valid.append(r)
+              elif isinstance(content, list):
+                  has_result = any(c.get('type') == 'tool_result' for c in content)
+                  has_text = any(c.get('type') == 'text' and c.get('text', '').strip() for c in content)
+                  if has_result or has_text:
+                      valid.append(r)
+
+      # 第二遍：提取工具调用、并行组、thinking、tool_result（精确关联）
+      all_tool_calls = []
+      tool_id_to_index = {}   # v2: 精确关联 tool_result
+      parallel_groups = []
+      user_goals = []
+      tool_counts = {}
+      seen_tool_types = set()
+
+      def trunc(v, limit):
+          s = str(v) if not isinstance(v, str) else v
+          return s[:limit] + ('...' if len(s) > limit else '')
+
+      for r in valid:
+          msg = r.get('message', {})
+          content = msg.get('content', '')
+          uuid = r.get('uuid', '')
+
+          if r['type'] == 'assistant' and isinstance(content, list):
+              # v2: 提取 thinking 块（AI 推理过程）
+              thinking_text = ''
+              for c in content:
+                  if c.get('type') == 'thinking':
+                      raw_think = c.get('thinking', '') or c.get('text', '')
+                      if raw_think:
+                          thinking_text = trunc(raw_think, TRUNC['thinking'])
+                          break
+
+              tc_list = [c for c in content if c.get('type') == 'tool_use']
+
+              # 并行组检测（保留代码，但 CC 实际拆分写入，此处通常为空）
+              agent_calls = [c for c in tc_list if c.get('name') == 'Agent']
+              if len(agent_calls) >= 2:
+                  parallel_groups.append({
+                      'assistant_uuid': uuid,
+                      'agents': [
+                          {
+                              'desc': trunc(c.get('input', {}).get('description',
+                                        c.get('input', {}).get('prompt', '')), 100),
+                              'subagent_type': c.get('input', {}).get('subagent_type', '')
+                          }
+                          for c in agent_calls
+                      ]
+                  })
+
+              for c in tc_list:
+                  name = c.get('name', '')
+                  inp = c.get('input', {})
+                  tool_id = c.get('id', '')
+                  tool_counts[name] = tool_counts.get(name, 0) + 1
+                  is_first_type = name not in seen_tool_types
+                  seen_tool_types.add(name)
+
+                  if name == 'Bash':
+                      brief = trunc(inp.get('command', ''), TRUNC['bash_cmd'])
+                  elif name in ('Agent', 'Skill'):
+                      brief = trunc(inp.get('description', inp.get('prompt', '')), TRUNC['prompt'])
+                  else:
+                      first_val = next(iter(inp.values()), '') if inp else ''
+                      brief = trunc(first_val, TRUNC['prompt'])
+
+                  entry = {
+                      'tool': name,
+                      'input_brief': brief,
+                      'subagent_type': inp.get('subagent_type', '') if name == 'Agent' else '',
+                      '_is_first_type': is_first_type,
+                  }
+                  # v2: 把 thinking 挂到该轮次的第一个 tool_call 上
+                  if thinking_text and not any(t.get('_assistant_uuid')
+                                                for t in all_tool_calls
+                                                if t.get('_assistant_uuid') == uuid):
+                      entry['reasoning_brief'] = thinking_text
+                  entry['_assistant_uuid'] = uuid
+
+                  all_tool_calls.append(entry)
+                  # v2: 精确索引，用于 tool_result 关联
+                  if tool_id:
+                      tool_id_to_index[tool_id] = len(all_tool_calls) - 1
+
+          elif r['type'] == 'user':
+              if isinstance(content, str) and content.strip():
+                  user_goals.append(content[:TRUNC['user_text']])
+              elif isinstance(content, list):
+                  for c in content:
+                      if c.get('type') == 'tool_result':
+                          tid = c.get('tool_use_id', '')
+                          rc = c.get('content', [])
+                          brief = ''
+                          if isinstance(rc, list):
+                              brief = next((x.get('text', '')[:TRUNC['result']]
+                                            for x in rc if x.get('type') == 'text'), '')
+                          elif isinstance(rc, str):
+                              brief = rc[:TRUNC['result']]
+                          # v2: 用 tool_use_id 精确关联，不再用 [-1]
+                          idx = tool_id_to_index.get(tid)
+                          if idx is not None and brief:
+                              all_tool_calls[idx]['result_brief'] = brief
+
+      # 采样：长会话保留关键部分
+      total_tc = len(all_tool_calls)
+      if total_tc > MAX_TOOL_CALLS:
+          p0 = [t for t in all_tool_calls if t.get('_is_first_type')]
+          p0_ids = {id(t) for t in p0}
+          rest = [t for t in all_tool_calls if id(t) not in p0_ids]
+          head = rest[:20]
+          tail = rest[-15:]
+          middle = rest[20:len(rest)-15]
+          denom = max(1, TARGET_TOOL_CALLS - len(p0) - 35)
+          step = max(1, len(middle) // denom) if middle else 1
+          sampled_middle = middle[::step] if middle else []
+          kept_ids = {id(t) for t in p0 + head + sampled_middle + tail}
+          all_tool_calls = [t for t in all_tool_calls if id(t) in kept_ids]
+
+      # v2: 强制截断到 TARGET，保证承诺真实
+      all_tool_calls = all_tool_calls[:TARGET_TOOL_CALLS]
+
+      # 复杂度评定
+      unique_types = len(tool_counts)
+      total_calls = sum(tool_counts.values())
+      if unique_types < 3 or total_calls < 5:
+          complexity = 'low'
+      elif unique_types >= 5 or total_calls >= 20:
+          complexity = 'high'
+      else:
+          complexity = 'medium'
+
+      # 子代理 meta
+      subagent_meta = []
+      if subagents_dir and os.path.isdir(subagents_dir):
+          for fname in os.listdir(subagents_dir):
+              if fname.endswith('.meta.json'):
+                  try:
+                      with open(os.path.join(subagents_dir, fname)) as mf:
+                          subagent_meta.append(json.load(mf))
+                  except Exception:
+                      pass
+
+      # 清理内部标记，补充序号
+      tool_trace = []
+      for i, t in enumerate(all_tool_calls):
+          entry = {k: v for k, v in t.items() if not k.startswith('_')}
+          entry['seq'] = i + 1
+          tool_trace.append(entry)
+
+      result = {
+          'session_uuid': session_uuid,
+          'session_path': session_path,
+          'stats': {
+              'total_raw_lines': total_raw,
+              'kept_tool_calls': len(tool_trace),
+              'dropped_noise': total_raw - len(valid),
+              'tool_counts': tool_counts,
+              'unique_tool_types': unique_types,
+              'parallel_groups_count': len(parallel_groups),
+              'complexity': complexity,
+          },
+          'user_goals': user_goals[:10],
+          'tool_trace': tool_trace,
+          'parallel_groups': parallel_groups,
+          'subagent_meta': subagent_meta,
+      }
+      print(json.dumps(result, ensure_ascii=False))
+      PYEOF
