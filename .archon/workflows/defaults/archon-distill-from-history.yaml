@@ -66,7 +66,7 @@ nodes:
       MAX_TOOL_CALLS = 80
       TARGET_TOOL_CALLS = 60
       TRUNC = {'bash_cmd': 300, 'prompt': 200, 'result': 200,
-               'thinking': 300, 'assistant_text': 150, 'user_text': 400}
+               'thinking': 300, 'user_text': 400}
 
       raw_records = []
       with open(session_path, encoding='utf-8', errors='strict') as f:
@@ -76,7 +76,7 @@ nodes:
                   continue
               try:
                   raw_records.append(json.loads(line))
-              except Exception:
+              except json.JSONDecodeError:
                   pass  # 跳过格式错误行
 
       total_raw = len(raw_records)
@@ -241,10 +241,10 @@ nodes:
           for fname in os.listdir(subagents_dir):
               if fname.endswith('.meta.json'):
                   try:
-                      with open(os.path.join(subagents_dir, fname)) as mf:
+                      with open(os.path.join(subagents_dir, fname), encoding='utf-8', errors='strict') as mf:
                           subagent_meta.append(json.load(mf))
-                  except Exception:
-                      pass
+                  except (json.JSONDecodeError, OSError) as e:
+                      print(f"Warning: failed to read subagent meta {fname}: {e}", file=sys.stderr)
 
       # 清理内部标记，补充序号
       tool_trace = []
