@@ -430,3 +430,156 @@ nodes:
       不要包裹任何 markdown 代码块标记（不要 ```yaml ... ```）。
     denied_tools: [Edit, Bash]
     depends_on: [analyze-intent]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 节点 4：以可读格式展示生成的工作流，供人工审阅
+  # ─────────────────────────────────────────────────────────────────────
+  - id: present-workflow
+    prompt: |
+      请读取生成的工作流 YAML 文件，以易读的自然语言 + ASCII DAG 形式展示给调用者。
+
+      1. 用 Bash 读取文件：
+         ```bash
+         cat "$ARTIFACTS_DIR/distilled-workflow.yaml"
+         ```
+
+      2. 按以下格式输出（不要输出原始 YAML）：
+
+         ---
+         **工作流名称**：<name>
+         **适用场景**：<description 中 "Use when" 部分>
+         **触发词**：<description 中 "Triggers" 部分>
+
+         **节点数量**：N 个节点
+
+         **DAG 结构**：
+         ```
+         node-a ──────────────────→ node-c
+         node-b ──────────────────↗
+         node-c ──→ node-d ──→ node-e
+         ```
+
+         **各节点说明**：
+         | 节点 | 类型 | 功能 | 依赖 |
+         |------|------|------|------|
+         | node-a | bash | <一行功能描述> | - |
+         | node-b | prompt | <一行功能描述> | node-a |
+         | ... | ... | ... | ... |
+
+         **参数化说明**：用户通过 $ARGUMENTS 传入 <说明工作流接受什么输入>
+         ---
+
+      输出内容将直接展示给调用者作为审阅依据，请确保清晰准确。
+    allowed_tools: [Bash]
+    depends_on: [generate-workflow]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 节点 5：人工审阅批准门（硬阻塞，capture_response 收集修改意见）
+  # ─────────────────────────────────────────────────────────────────────
+  - id: review-approval
+    approval:
+      message: |
+        请审阅上方生成的工作流。
+
+        $present-workflow.output
+
+        如需修改，请在批准时附上具体意见（例如："节点 X 改为并行"、"增加 approval 节点"）。
+        批准后将自动校验并保存工作流。
+      capture_response: true
+    depends_on: [present-workflow]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 节点 6：本地校验循环（应用审阅意见 → 写盘 → CLI 校验 → 修正）
+  # 完全无 HTTP 依赖，不需要 archon server 在跑
+  # ─────────────────────────────────────────────────────────────────────
+  - id: validate-and-fix
+    loop:
+      prompt: |
+        你的任务：校验工作流并把它就位到 `.archon/workflows/`，应用审阅意见，校验通过即完成。
+
+        ## 工作副本（用于编辑）
+
+        `$ARTIFACTS_DIR/distilled-workflow.yaml`
+
+        ## 审阅者意见（如有）
+
+        $review-approval.output
+
+        ## 步骤
+
+        1. **应用审阅意见**：如果上方"审阅者意见"非空且包含修改要求，
+           用 Read 工具读取 `$ARTIFACTS_DIR/distilled-workflow.yaml`，
+           用 Write 工具按意见重写文件（保持工作副本同步）。
+           如果意见为空或仅是"Approved"，跳过本步。
+
+        2. **提取工作流名称、写入目标位置**：
+
+           ```bash
+           WORKFLOW_NAME=$(grep -E '^name:' "$ARTIFACTS_DIR/distilled-workflow.yaml" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+           if [ -z "$WORKFLOW_NAME" ]; then
+             echo "错误：无法从 YAML 提取 name 字段"
+             exit 1
+           fi
+           mkdir -p .archon/workflows
+           cp "$ARTIFACTS_DIR/distilled-workflow.yaml" ".archon/workflows/$WORKFLOW_NAME.yaml"
+           echo "已写入：.archon/workflows/$WORKFLOW_NAME.yaml"
+           ```
+
+        3. **本地 CLI 校验**（无需 archon server）：
+
+           ```bash
+           bun run cli validate workflows "$WORKFLOW_NAME" 2>&1
+           VALIDATE_EXIT=$?
+           echo "校验退出码：$VALIDATE_EXIT"
+           ```
+
+        4. **判断结果**：
+           - 退出码为 0（校验通过）→ 在你的回复**末尾**输出 `VALIDATED`，本次迭代结束
+           - 退出码非 0 → 阅读上方校验错误，用 Edit/Write 工具修改
+             `$ARTIFACTS_DIR/distilled-workflow.yaml`，然后**回到步骤 2 重新写盘并校验**
+
+        ## 常见错误及修正
+
+        | 错误关键字 | 修正方向 |
+        |-----------|---------|
+        | `Missing required field 'name'` | 确保 YAML 顶层有 `name: workflow-name` |
+        | `Missing required field 'description'` | 添加 `description: \|` 多行块 |
+        | `Duplicate node id` | 为重复 id 添加数字后缀 |
+        | `depends_on references unknown node` | 修正 id 拼写 |
+        | `Cycle detected` | 移除循环依赖 |
+        | `loop requires until` | 为 loop 节点补 `until:` 字段 |
+        | `script node requires runtime` | 添加 `runtime: bun` 或 `runtime: uv` |
+        | `Node 'X': Unrecognized key` | 检查字段拼写，与上方节点类型参考对照 |
+        | `output_format requires required field` | 在 output_format 内添加 `required: [field1, ...]` |
+      until: VALIDATED
+      max_iterations: 3
+    depends_on: [review-approval]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 节点 7：最终报告（写入工作已在 validate-and-fix 中完成）
+  # ─────────────────────────────────────────────────────────────────────
+  - id: save-workflow
+    bash: |
+      set -e
+
+      WORKFLOW_NAME=$(grep -E '^name:' "$ARTIFACTS_DIR/distilled-workflow.yaml" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+      WORKFLOW_PATH=".archon/workflows/$WORKFLOW_NAME.yaml"
+
+      if [ -z "$WORKFLOW_NAME" ]; then
+        echo "错误：无法读取工作流名称"
+        exit 1
+      fi
+
+      if [ ! -f "$WORKFLOW_PATH" ]; then
+        echo "错误：未在 $WORKFLOW_PATH 找到已保存的工作流"
+        exit 1
+      fi
+
+      echo "✓ 工作流已沉淀完成"
+      echo ""
+      echo "  名称：$WORKFLOW_NAME"
+      echo "  位置：$WORKFLOW_PATH"
+      echo ""
+      echo "  触发方式：archon workflow run $WORKFLOW_NAME"
+      echo "  校验方式：bun run cli validate workflows $WORKFLOW_NAME"
+    depends_on: [validate-and-fix]
