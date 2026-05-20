@@ -272,3 +272,80 @@ nodes:
       }
       print(json.dumps(result, ensure_ascii=False))
       PYEOF
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 节点 2：提取可泛化的工作流意图
+  # ─────────────────────────────────────────────────────────────────────
+  - id: analyze-intent
+    prompt: |
+      你是一名工作流架构师，擅长从 AI 执行轨迹中提取可复用的通用流程模式。
+
+      ## CC 会话结构化数据
+
+      $load-session-data.output
+
+      ## 用户补充说明（可选）
+
+      $ARGUMENTS
+
+      ## 任务
+
+      分析上述执行轨迹，提取一个**可泛化的**工作流结构。
+
+      ### 输入数据说明
+
+      - `user_goals`：用户在会话中的请求（最重要的意图证据）
+      - `tool_trace`：工具调用序列，含 `input_brief`、`result_brief`、`reasoning_brief`（AI 推理）
+      - `parallel_groups`：并行 Agent 调用（通常为空，但若非空说明确有并行模式）
+      - `stats.complexity`：复杂度评级
+      - `stats.tool_counts`：工具使用统计
+
+      ### 核心原则
+
+      1. **泛化，不具化**：命名描述任务类型而非具体实例。
+         正例：`repo-architecture-analysis`；反例：`analyze-archon-repo`。
+         节点中不得硬编码具体仓库名、用户名或路径。
+
+      2. **工具类型映射**：
+         - 主要为 Bash → `bash:` 节点
+         - 重复的 AI 推理任务 → `prompt:` 节点
+         - 数据转换模式 → `script:` 节点
+         - 用户决策点 → `approval:` 节点
+         - 重复迭代 → `loop:` 节点
+
+      3. **并行机会识别**：基于 `tool_trace` 的语义判断（同类型工具连续调用、子任务相互独立）
+         决定是否设计为并行节点（共享父节点依赖）。**不要硬性依赖 parallel_groups 字段**。
+
+      4. **可行性判断**：`stats.complexity == "low"` 时返回 `feasibility: false`。
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        workflow_name:
+          type: string
+          description: "短横线命名，≤ 30 字符，描述任务类型"
+        description:
+          type: string
+          description: "遵循 'Use when / Triggers / Does / NOT for' 格式"
+        trigger_phrases:
+          type: string
+          description: "5-8 个触发短语，逗号分隔"
+        dag_structure:
+          type: string
+          description: "节点列表，含 id、类型、功能、depends_on，自然语言描述"
+        has_parallelism:
+          type: boolean
+        feasibility:
+          type: boolean
+        feasibility_reason:
+          type: string
+      required:
+        - workflow_name
+        - description
+        - trigger_phrases
+        - dag_structure
+        - has_parallelism
+        - feasibility
+        - feasibility_reason
+    depends_on: [load-session-data]
