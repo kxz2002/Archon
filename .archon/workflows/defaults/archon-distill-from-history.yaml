@@ -28,7 +28,7 @@ nodes:
       PROJECT_KEY=$(echo "$PWD" | sed 's|^/||' | tr '/' '-')
       PROJECTS_DIR="$HOME/.claude/projects/-$PROJECT_KEY"
 
-      if [ -n "$ARGUMENTS" ] && [ "$ARGUMENTS" != "" ]; then
+      if [ -n "$ARGUMENTS" ]; then
         if [ -f "$ARGUMENTS" ]; then
           SESSION_PATH="$ARGUMENTS"
         elif [ -f "$PROJECTS_DIR/$ARGUMENTS.jsonl" ]; then
@@ -69,15 +69,23 @@ nodes:
                'thinking': 300, 'user_text': 400}
 
       raw_records = []
-      with open(session_path, encoding='utf-8', errors='strict') as f:
-          for line in f:
-              line = line.strip()
-              if not line:
-                  continue
-              try:
-                  raw_records.append(json.loads(line))
-              except json.JSONDecodeError:
-                  pass  # 跳过格式错误行
+      try:
+          with open(session_path, encoding='utf-8', errors='strict') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      raw_records.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      pass
+      except OSError as e:
+          print(json.dumps({
+              'error': f'cannot read session file: {e}',
+              'stats': {'complexity': 'low'},
+              'user_goals': [], 'tool_trace': [], 'parallel_groups': []
+          }, ensure_ascii=False))
+          sys.exit(0)
 
       total_raw = len(raw_records)
 
@@ -119,8 +127,12 @@ nodes:
       seen_tool_types = set()
 
       def trunc(v, limit):
+          if v is None:
+              return ''
           s = str(v) if not isinstance(v, str) else v
           return s[:limit] + ('...' if len(s) > limit else '')
+
+      seen_thinking_uuids = set()
 
       for r in valid:
           msg = r.get('message', {})
@@ -177,10 +189,9 @@ nodes:
                       '_is_first_type': is_first_type,
                   }
                   # v2: 把 thinking 挂到该轮次的第一个 tool_call 上
-                  if thinking_text and not any(t.get('_assistant_uuid')
-                                                for t in all_tool_calls
-                                                if t.get('_assistant_uuid') == uuid):
+                  if thinking_text and uuid not in seen_thinking_uuids:
                       entry['reasoning_brief'] = thinking_text
+                      seen_thinking_uuids.add(uuid)
                   entry['_assistant_uuid'] = uuid
 
                   all_tool_calls.append(entry)
@@ -259,7 +270,7 @@ nodes:
           'stats': {
               'total_raw_lines': total_raw,
               'kept_tool_calls': len(tool_trace),
-              'dropped_noise': total_raw - len(valid),
+              'dropped_records': total_raw - len(valid),
               'tool_counts': tool_counts,
               'unique_tool_types': unique_types,
               'parallel_groups_count': len(parallel_groups),
