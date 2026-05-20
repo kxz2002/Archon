@@ -349,3 +349,84 @@ nodes:
         - feasibility
         - feasibility_reason
     depends_on: [load-session-data]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 节点 3：生成工作流 YAML，写入 $ARTIFACTS_DIR
+  # ─────────────────────────────────────────────────────────────────────
+  - id: generate-workflow
+    prompt: |
+      你是一名 Archon 工作流作者。根据下方意图生成完整、合法的 Archon 工作流 YAML。
+
+      ## 工作流意图
+
+      - **名称**：$analyze-intent.output.workflow_name
+      - **描述**：$analyze-intent.output.description
+      - **触发短语**：$analyze-intent.output.trigger_phrases
+      - **DAG 结构**：$analyze-intent.output.dag_structure
+      - **存在并行层**：$analyze-intent.output.has_parallelism
+
+      ## Archon 节点类型参考（每个节点只选其一）
+
+      ```yaml
+      # prompt 节点（AI 执行）
+      - id: my-node
+        prompt: |
+          给 AI 的指令，可用 $other-node.output 引用上游输出
+        model: haiku          # 可选
+        allowed_tools: []     # 可选
+        output_format:        # 可选，结构化输出
+          type: object
+          properties:
+            field: { type: string }
+          required: [field]
+
+      # bash 节点（Shell，无 AI，stdout = $<id>.output）
+      - id: my-bash
+        bash: |
+          set -e
+          echo "result"
+
+      # script 节点（Python/TypeScript，无 AI，stdout = $<id>.output）
+      - id: my-script
+        script: |
+          import json, sys
+          data = json.loads("""$other.output""")
+          print(json.dumps({"key": "val"}))
+        runtime: uv   # 必填：'bun' 或 'uv'
+
+      # loop 节点
+      - id: my-loop
+        loop:
+          prompt: |
+            每次迭代的指令...
+          until: DONE_SIGNAL
+          max_iterations: 5
+
+      # approval 节点（人工审批，硬阻塞）
+      - id: my-approval
+        approval:
+          message: "请审阅并确认。"
+      ```
+
+      通用字段：`depends_on: [node-id]`、`when: "$node.output == 'value'"`
+
+      变量：`$ARGUMENTS`、`$ARTIFACTS_DIR`、`$<nodeId>.output`、`$<nodeId>.output.field`
+
+      ## 生成规则
+
+      1. `name:` 字段必须完全等于 `$analyze-intent.output.workflow_name`
+      2. 节点 id 唯一，短横线格式
+      3. 每节点只选一种类型（互斥）
+      4. bash 节点必须有 `set -e`
+      5. 不硬编码具体仓库名或路径，用 `$ARGUMENTS` 参数化
+      6. 不无故添加 `model:` 字段
+
+      ## 输出要求
+
+      把工作流写为合法 YAML 字符串，保存到 `$ARTIFACTS_DIR/distilled-workflow.yaml`。
+      **使用 Write 工具写文件**，不要使用 Edit 或 Bash。
+
+      文件内容必须是完整的工作流 YAML（顶层有 `name:`、`description:`、`nodes:`），
+      不要包裹任何 markdown 代码块标记（不要 ```yaml ... ```）。
+    denied_tools: [Edit, Bash]
+    depends_on: [analyze-intent]
