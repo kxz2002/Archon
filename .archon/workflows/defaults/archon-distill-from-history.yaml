@@ -15,22 +15,36 @@ description: |
   Optional: pass a session UUID or full JSONL path as $ARGUMENTS.
   If omitted, auto-detects the most recent CC session for the current project.
 
+interactive: true
+provider: claude
+
 nodes:
   # ─────────────────────────────────────────────────────────────────────
-  # 节点 1：加载 CC 会话数据（参考 issue #976 load-run-data 模式）
-  # 集中提取结构化数据，所有下游节点统一消费此输出
+  # Node 1: Load CC session data (follows the load-run-data pattern from issue #976).
+  # Centralized structured extraction; all downstream nodes consume this output.
   # ─────────────────────────────────────────────────────────────────────
   - id: load-session-data
     bash: |
       set -e
 
-      # ── 1. 发现 JSONL 路径 ──────────────────────────────────────────
+      # ── 1. Discover JSONL path ─────────────────────────────────────
       PROJECT_KEY=$(echo "$PWD" | sed 's|^/||' | tr '/' '-')
       PROJECTS_DIR="$HOME/.claude/projects/-$PROJECT_KEY"
+      ALLOWED_ROOT="$HOME/.claude/projects"
 
       if [ -n "$ARGUMENTS" ]; then
         if [ -f "$ARGUMENTS" ]; then
-          SESSION_PATH="$ARGUMENTS"
+          # Resolve real path and enforce allowlist (block traversal/symlink escape)
+          REAL_PATH=$(realpath -e "$ARGUMENTS" 2>/dev/null || echo "")
+          case "$REAL_PATH" in
+            "$ALLOWED_ROOT"/*)
+              SESSION_PATH="$REAL_PATH"
+              ;;
+            *)
+              echo '{"error": "path outside ~/.claude/projects/ is not allowed", "stats": {"complexity": "low"}, "user_goals": [], "tool_trace": [], "parallel_groups": []}'
+              exit 0
+              ;;
+          esac
         elif [ -f "$PROJECTS_DIR/$ARGUMENTS.jsonl" ]; then
           SESSION_PATH="$PROJECTS_DIR/$ARGUMENTS.jsonl"
         else
@@ -52,7 +66,7 @@ nodes:
       SESSION_UUID=$(basename "$SESSION_PATH" .jsonl)
       SUBAGENTS_DIR="$PROJECTS_DIR/$SESSION_UUID/subagents"
 
-      # ── 2. Python 提取并结构化 JSONL ────────────────────────────────
+      # ── 2. Extract and structure JSONL via Python ──────────────────
       python3 - "$SESSION_PATH" "$SUBAGENTS_DIR" <<'PYEOF'
       import sys, json, os
 
@@ -60,7 +74,7 @@ nodes:
       subagents_dir = sys.argv[2] if len(sys.argv) > 2 else ""
       session_uuid = os.path.basename(session_path).replace('.jsonl', '')
 
-      # v2: 补上 last-prompt
+      # Includes 'last-prompt' as noise
       NOISE_TYPES = {'file-history-snapshot', 'permission-mode', 'attachment',
                      'system', 'last-prompt'}
       MAX_TOOL_CALLS = 80
@@ -79,7 +93,7 @@ nodes:
                       raw_records.append(json.loads(line))
                   except json.JSONDecodeError:
                       pass
-      except OSError as e:
+      except (OSError, UnicodeDecodeError) as e:
           print(json.dumps({
               'error': f'cannot read session file: {e}',
               'stats': {'complexity': 'low'},
@@ -89,7 +103,7 @@ nodes:
 
       total_raw = len(raw_records)
 
-      # 第一遍：收集有效消息
+      # Pass 1: collect valid messages
       valid = []
       for r in raw_records:
           if r.get('type') in NOISE_TYPES:
@@ -118,9 +132,9 @@ nodes:
                   if has_result or has_text:
                       valid.append(r)
 
-      # 第二遍：提取工具调用、并行组、thinking、tool_result（精确关联）
+      # Pass 2: extract tool calls, parallel groups, thinking, tool_result (with precise correlation)
       all_tool_calls = []
-      tool_id_to_index = {}   # v2: 精确关联 tool_result
+      tool_id_to_index = {}   # Precise tool_result correlation
       parallel_groups = []
       user_goals = []
       tool_counts = {}
@@ -129,7 +143,10 @@ nodes:
       def trunc(v, limit):
           if v is None:
               return ''
-          s = str(v) if not isinstance(v, str) else v
+          if isinstance(v, str):
+              s = v
+          else:
+              s = json.dumps(v, ensure_ascii=False)
           return s[:limit] + ('...' if len(s) > limit else '')
 
       seen_thinking_uuids = set()
@@ -140,7 +157,7 @@ nodes:
           uuid = r.get('uuid', '')
 
           if r['type'] == 'assistant' and isinstance(content, list):
-              # v2: 提取 thinking 块（AI 推理过程）
+              # Extract thinking block (AI reasoning)
               thinking_text = ''
               for c in content:
                   if c.get('type') == 'thinking':
@@ -151,7 +168,7 @@ nodes:
 
               tc_list = [c for c in content if c.get('type') == 'tool_use']
 
-              # 并行组检测（保留代码，但 CC 实际拆分写入，此处通常为空）
+              # Parallel group detection (kept for completeness; CC usually splits writes, so this is typically empty)
               agent_calls = [c for c in tc_list if c.get('name') == 'Agent']
               if len(agent_calls) >= 2:
                   parallel_groups.append({
@@ -188,14 +205,14 @@ nodes:
                       'subagent_type': inp.get('subagent_type', '') if name == 'Agent' else '',
                       '_is_first_type': is_first_type,
                   }
-                  # v2: 把 thinking 挂到该轮次的第一个 tool_call 上
+                  # Attach thinking to the first tool_call of the same assistant turn
                   if thinking_text and uuid not in seen_thinking_uuids:
                       entry['reasoning_brief'] = thinking_text
                       seen_thinking_uuids.add(uuid)
                   entry['_assistant_uuid'] = uuid
 
                   all_tool_calls.append(entry)
-                  # v2: 精确索引，用于 tool_result 关联
+                  # Precise index for tool_result correlation
                   if tool_id:
                       tool_id_to_index[tool_id] = len(all_tool_calls) - 1
 
@@ -213,12 +230,12 @@ nodes:
                                             for x in rc if x.get('type') == 'text'), '')
                           elif isinstance(rc, str):
                               brief = rc[:TRUNC['result']]
-                          # v2: 用 tool_use_id 精确关联，不再用 [-1]
+                          # Precise correlation via tool_use_id (no more positional [-1] guess)
                           idx = tool_id_to_index.get(tid)
                           if idx is not None and brief:
                               all_tool_calls[idx]['result_brief'] = brief
 
-      # 采样：长会话保留关键部分
+      # Sampling: keep key portions for long sessions
       total_tc = len(all_tool_calls)
       if total_tc > MAX_TOOL_CALLS:
           p0 = [t for t in all_tool_calls if t.get('_is_first_type')]
@@ -233,10 +250,10 @@ nodes:
           kept_ids = {id(t) for t in p0 + head + sampled_middle + tail}
           all_tool_calls = [t for t in all_tool_calls if id(t) in kept_ids]
 
-      # v2: 强制截断到 TARGET，保证承诺真实
+      # Hard cap at TARGET so the documented bound is real
       all_tool_calls = all_tool_calls[:TARGET_TOOL_CALLS]
 
-      # 复杂度评定
+      # Complexity classification
       unique_types = len(tool_counts)
       total_calls = sum(tool_counts.values())
       if unique_types < 3 or total_calls < 5:
@@ -246,10 +263,10 @@ nodes:
       else:
           complexity = 'medium'
 
-      # 子代理 meta
+      # Subagent meta
       subagent_meta = []
       if subagents_dir and os.path.isdir(subagents_dir):
-          for fname in os.listdir(subagents_dir):
+          for fname in sorted(os.listdir(subagents_dir)):
               if fname.endswith('.meta.json'):
                   try:
                       with open(os.path.join(subagents_dir, fname), encoding='utf-8', errors='strict') as mf:
@@ -257,7 +274,7 @@ nodes:
                   except (json.JSONDecodeError, OSError) as e:
                       print(f"Warning: failed to read subagent meta {fname}: {e}", file=sys.stderr)
 
-      # 清理内部标记，补充序号
+      # Strip internal markers and add sequence numbers
       tool_trace = []
       for i, t in enumerate(all_tool_calls):
           entry = {k: v for k, v in t.items() if not k.startswith('_')}
@@ -285,66 +302,70 @@ nodes:
       PYEOF
 
   # ─────────────────────────────────────────────────────────────────────
-  # 节点 2：提取可泛化的工作流意图
+  # Node 2: Extract a generalizable workflow intent from the execution trace.
   # ─────────────────────────────────────────────────────────────────────
   - id: analyze-intent
     prompt: |
-      你是一名工作流架构师，擅长从 AI 执行轨迹中提取可复用的通用流程模式。
+      You are a workflow architect skilled at distilling reusable, generic process
+      patterns from AI execution traces.
 
-      ## CC 会话结构化数据
+      ## Structured CC session data
 
       $load-session-data.output
 
-      ## 用户补充说明（可选）
+      ## Optional user notes
 
       $ARGUMENTS
 
-      ## 任务
+      ## Task
 
-      分析上述执行轨迹，提取一个**可泛化的**工作流结构。
+      Analyze the trace above and extract a **generalizable** workflow structure.
 
-      ### 输入数据说明
+      ### Input data reference
 
-      - `user_goals`：用户在会话中的请求（最重要的意图证据）
-      - `tool_trace`：工具调用序列，含 `input_brief`、`result_brief`、`reasoning_brief`（AI 推理）
-      - `parallel_groups`：并行 Agent 调用（通常为空，但若非空说明确有并行模式）
-      - `stats.complexity`：复杂度评级
-      - `stats.tool_counts`：工具使用统计
+      - `user_goals`: user requests in the session (the most important intent signal)
+      - `tool_trace`: tool-call sequence with `input_brief`, `result_brief`, `reasoning_brief` (AI reasoning)
+      - `parallel_groups`: parallel Agent calls (usually empty; non-empty implies a real parallel pattern)
+      - `stats.complexity`: complexity rating
+      - `stats.tool_counts`: tool-usage stats
 
-      ### 核心原则
+      ### Core principles
 
-      1. **泛化，不具化**：命名描述任务类型而非具体实例。
-         正例：`repo-architecture-analysis`；反例：`analyze-archon-repo`。
-         节点中不得硬编码具体仓库名、用户名或路径。
+      1. **Generalize, do not specialize**: the name describes a task TYPE, not a
+         specific instance. Good: `repo-architecture-analysis`. Bad:
+         `analyze-archon-repo`. Nodes must not hard-code specific repo names,
+         usernames, or paths.
 
-      2. **工具类型映射**：
-         - 主要为 Bash → `bash:` 节点
-         - 重复的 AI 推理任务 → `prompt:` 节点
-         - 数据转换模式 → `script:` 节点
-         - 用户决策点 → `approval:` 节点
-         - 重复迭代 → `loop:` 节点
+      2. **Tool-type mapping**:
+         - Mostly Bash -> `bash:` node
+         - Repeated AI reasoning -> `prompt:` node
+         - Data-transformation pattern -> `script:` node
+         - User decision point -> `approval:` node
+         - Repeated iteration -> `loop:` node
 
-      3. **并行机会识别**：基于 `tool_trace` 的语义判断（同类型工具连续调用、子任务相互独立）
-         决定是否设计为并行节点（共享父节点依赖）。**不要硬性依赖 parallel_groups 字段**。
+      3. **Parallelism detection**: judge from the semantics of `tool_trace`
+         (same-type tools called back-to-back, sub-tasks independent of each other)
+         to decide whether to model parallel nodes (sharing a parent). **Do not
+         rely solely on the `parallel_groups` field.**
 
-      4. **可行性判断**：`stats.complexity == "low"` 时返回 `feasibility: false`。
-    model: haiku
+      4. **Feasibility**: return `feasibility: false` when `stats.complexity == "low"`.
+    model: sonnet
     allowed_tools: []
     output_format:
       type: object
       properties:
         workflow_name:
           type: string
-          description: "短横线命名，≤ 30 字符，描述任务类型"
+          description: "kebab-case, <= 30 chars, describes the task type"
         description:
           type: string
-          description: "遵循 'Use when / Triggers / Does / NOT for' 格式"
+          description: "follows the 'Use when / Triggers / Does / NOT for' format"
         trigger_phrases:
           type: string
-          description: "5-8 个触发短语，逗号分隔"
+          description: "5-8 trigger phrases, comma-separated"
         dag_structure:
           type: string
-          description: "节点列表，含 id、类型、功能、depends_on，自然语言描述"
+          description: "natural-language node list with id, type, purpose, depends_on"
         has_parallelism:
           type: boolean
         feasibility:
@@ -362,235 +383,411 @@ nodes:
     depends_on: [load-session-data]
 
   # ─────────────────────────────────────────────────────────────────────
-  # 节点 3：生成工作流 YAML，写入 $ARTIFACTS_DIR
+  # Node 3: Generate the workflow YAML and write it to $ARTIFACTS_DIR.
+  # Skipped when analyze-intent decided the trace is not workflow-worthy.
   # ─────────────────────────────────────────────────────────────────────
   - id: generate-workflow
     prompt: |
-      你是一名 Archon 工作流作者。根据下方意图生成完整、合法的 Archon 工作流 YAML。
+      You are an Archon workflow author. Generate a complete, valid Archon workflow
+      YAML from the intent below.
 
-      ## 工作流意图
+      ## Workflow intent
 
-      - **名称**：$analyze-intent.output.workflow_name
-      - **描述**：$analyze-intent.output.description
-      - **触发短语**：$analyze-intent.output.trigger_phrases
-      - **DAG 结构**：$analyze-intent.output.dag_structure
-      - **存在并行层**：$analyze-intent.output.has_parallelism
+      - **Name**: $analyze-intent.output.workflow_name
+      - **Description**: $analyze-intent.output.description
+      - **Trigger phrases**: $analyze-intent.output.trigger_phrases
+      - **DAG structure**: $analyze-intent.output.dag_structure
+      - **Has a parallel layer**: $analyze-intent.output.has_parallelism
 
-      ## Archon 节点类型参考（每个节点只选其一）
+      ## Archon node-type reference (pick exactly one per node)
 
       ```yaml
-      # prompt 节点（AI 执行）
+      # prompt node (AI execution)
       - id: my-node
         prompt: |
-          给 AI 的指令，可用 $other-node.output 引用上游输出
-        model: haiku          # 可选
-        allowed_tools: []     # 可选
-        output_format:        # 可选，结构化输出
+          Instructions to the AI; you can reference upstream output via $other-node.output
+        model: haiku          # optional
+        allowed_tools: []     # optional
+        output_format:        # optional, structured output
           type: object
           properties:
             field: { type: string }
           required: [field]
 
-      # bash 节点（Shell，无 AI，stdout = $<id>.output）
+      # bash node (shell, no AI, stdout = $<id>.output)
       - id: my-bash
         bash: |
           set -e
           echo "result"
 
-      # script 节点（Python/TypeScript，无 AI，stdout = $<id>.output）
+      # script node (Python, no AI, stdout = $<id>.output)
+      # $ARGUMENTS and $nodeId.output are text-substituted into the body.
+      # For safe handling of upstream JSON, write it to a temp file first.
       - id: my-script
         script: |
-          import json, sys
-          data = json.loads("""$other.output""")
-          print(json.dumps({"key": "val"}))
-        runtime: uv   # 必填：'bun' 或 'uv'
+          import json, os, sys
 
-      # loop 节点
+          # $ARGUMENTS is text-substituted (use directly in the script body)
+          args_text = "$ARGUMENTS"
+          result = {"args": args_text, "artifacts_dir": os.environ.get("ARTIFACTS_DIR", "")}
+          print(json.dumps(result))
+        runtime: uv   # required: 'bun' or 'uv'
+
+      # loop node
       - id: my-loop
         loop:
           prompt: |
-            每次迭代的指令...
+            Per-iteration instructions...
           until: DONE_SIGNAL
           max_iterations: 5
 
-      # approval 节点（人工审批，硬阻塞）
+      # approval node (human gate, hard block)
       - id: my-approval
         approval:
-          message: "请审阅并确认。"
+          message: "Please review and confirm."
       ```
 
-      通用字段：`depends_on: [node-id]`、`when: "$node.output == 'value'"`
+      Common fields: `depends_on: [node-id]`, `when: "$node.output == 'value'"`
 
-      变量：`$ARGUMENTS`、`$ARTIFACTS_DIR`、`$<nodeId>.output`、`$<nodeId>.output.field`
+      ### Variable resolution (CRITICAL — syntax is node-type-dependent)
 
-      ## 生成规则
+      Not every variable syntax works in every node type. Use ONLY the supported
+      forms below. `{{ .Args.xxx }}` and `${{...}}` are NEVER valid in Archon.
 
-      1. `name:` 字段必须完全等于 `$analyze-intent.output.workflow_name`
-      2. 节点 id 唯一，短横线格式
-      3. 每节点只选一种类型（互斥）
-      4. bash 节点必须有 `set -e`
-      5. 不硬编码具体仓库名或路径，用 `$ARGUMENTS` 参数化
-      6. 不无故添加 `model:` 字段
+      | Variable | prompt | bash | script | approval |
+      |----------|--------|------|--------|----------|
+      | `$ARGUMENTS` | text-substituted | env var `$ARGUMENTS` | text-substituted | NO |
+      | `$nodeId.output` | text-substituted | shell-quoted substitution | raw text substitution | text-substituted |
+      | `$nodeId.output.field` | text-substituted | shell-quoted substitution | raw text substitution | text-substituted |
+      | `$ARTIFACTS_DIR` | text-substituted | text-substituted | text + env `$ARTIFACTS_DIR` | NO |
 
-      ## 输出要求
+      **Key rules:**
+      - Prompt/loop nodes: all variables are text-substituted. Use `$nodeId.output`
+        and `$nodeId.output.field` freely.
+      - Bash nodes: `$ARGUMENTS` is available as the env var `$ARGUMENTS` (not
+        text-substituted). `$nodeId.output` and `$nodeId.output.field` ARE resolved
+        with shell-safe quoting. For complex JSON manipulation, prefer a script node.
+      - Script nodes: `$ARGUMENTS` and `$nodeId.output` are text-substituted into
+        the script body. If the output may contain quotes, newlines, or special
+        characters, write it to a temp file in `$ARTIFACTS_DIR` and read it back.
+      - Approval nodes: `$nodeId.output` and `$nodeId.output.field` are resolved.
+        `$ARGUMENTS` and `$ARTIFACTS_DIR` are NOT resolved in approval messages.
+      - **Never use `{{ .Args.xxx }}`** — that is Go-template syntax, not
+        supported by Archon.
+      - **Never use `${VAR}` or `${nodeId.output}` with braces.** Archon's
+        substitution regexes only match `$VAR` and `$nodeId.output` (without
+        braces). `${}` is bash syntax — it will NOT be resolved by the engine
+        and will appear as literal text to the AI.
 
-      把工作流写为合法 YAML 字符串，保存到 `$ARTIFACTS_DIR/distilled-workflow.yaml`。
-      **使用 Write 工具写文件**，不要使用 Edit 或 Bash。
+      ## Generation rules
 
-      文件内容必须是完整的工作流 YAML（顶层有 `name:`、`description:`、`nodes:`），
-      不要包裹任何 markdown 代码块标记（不要 ```yaml ... ```）。
+      1. The top-level `name:` field must exactly equal `$analyze-intent.output.workflow_name`
+      2. Node ids are unique and kebab-cased
+      3. Each node picks exactly one type (mutually exclusive)
+      4. Bash nodes should use `set -e` at the top. When a command's non-zero exit
+         code must be captured (e.g. `grep` that may not match), use this pattern:
+         ```bash
+         set +e
+         command_that_may_fail
+         EXIT_CODE=$?
+         set -e
+         ```
+         Never use bare `command || true` — the exit code is lost.
+      5. Do not hard-code specific repo names or paths; parameterize via `$ARGUMENTS`
+      6. Do not add a `model:` field unless there is a real reason
+
+      ## Output requirements
+
+      Save the workflow as a valid YAML string at `$ARTIFACTS_DIR/distilled-workflow.yaml`.
+      **Use the Write tool** to create the file — do not use Edit or Bash.
+
+      The file content must be a complete workflow YAML (top-level `name:`,
+      `description:`, `nodes:`). Do not wrap it in markdown code fences
+      (no ```yaml ... ```).
+    model: opus
     denied_tools: [Edit, Bash]
+    when: "$analyze-intent.output.feasibility == 'true'"
     depends_on: [analyze-intent]
 
   # ─────────────────────────────────────────────────────────────────────
-  # 节点 4：以可读格式展示生成的工作流，供人工审阅
+  # Node 4: Render the generated workflow in a human-readable form for review.
   # ─────────────────────────────────────────────────────────────────────
   - id: present-workflow
     prompt: |
-      请读取生成的工作流 YAML 文件，以易读的自然语言 + ASCII DAG 形式展示给调用者。
+      Read the generated workflow YAML and present it to the caller as readable
+      natural language plus an ASCII DAG diagram.
 
-      1. 用 Bash 读取文件：
+      1. Read the file with Bash:
          ```bash
          cat "$ARTIFACTS_DIR/distilled-workflow.yaml"
          ```
 
-      2. 按以下格式输出（不要输出原始 YAML）：
+      2. Output in the format below (do NOT dump raw YAML):
 
          ---
-         **工作流名称**：<name>
-         **适用场景**：<description 中 "Use when" 部分>
-         **触发词**：<description 中 "Triggers" 部分>
+         **Workflow name**: <name>
+         **Use when**: <the "Use when" part of description>
+         **Triggers**: <the "Triggers" part of description>
 
-         **节点数量**：N 个节点
+         **Node count**: N nodes
 
-         **DAG 结构**：
+         **DAG structure**:
          ```
          node-a ──────────────────→ node-c
          node-b ──────────────────↗
          node-c ──→ node-d ──→ node-e
          ```
 
-         **各节点说明**：
-         | 节点 | 类型 | 功能 | 依赖 |
-         |------|------|------|------|
-         | node-a | bash | <一行功能描述> | - |
-         | node-b | prompt | <一行功能描述> | node-a |
+         **Per-node breakdown**:
+         | Node | Type | Purpose | Depends on |
+         |------|------|---------|------------|
+         | node-a | bash | <one-line purpose> | - |
+         | node-b | prompt | <one-line purpose> | node-a |
          | ... | ... | ... | ... |
 
-         **参数化说明**：用户通过 $ARGUMENTS 传入 <说明工作流接受什么输入>
+         **Parameterization**: the user passes <describe expected input> via $ARGUMENTS
          ---
 
-      输出内容将直接展示给调用者作为审阅依据，请确保清晰准确。
+      This output is shown directly to the reviewer as the basis for approval, so
+      be clear and accurate.
     allowed_tools: [Bash]
+    when: "$analyze-intent.output.feasibility == 'true'"
     depends_on: [generate-workflow]
 
   # ─────────────────────────────────────────────────────────────────────
-  # 节点 5：人工审阅批准门（硬阻塞，capture_response 收集修改意见）
+  # Node 5: Human review gate (hard block; capture_response collects feedback).
   # ─────────────────────────────────────────────────────────────────────
   - id: review-approval
     approval:
       message: |
-        请审阅上方生成的工作流。
+        Please review the generated workflow above.
 
         $present-workflow.output
 
-        如需修改，请在批准时附上具体意见（例如："节点 X 改为并行"、"增加 approval 节点"）。
-        批准后将自动校验并保存工作流。
+        If you want changes, include concrete feedback when approving
+        (e.g. "make node X run in parallel", "add an approval gate").
+        After approval, the workflow will be validated and saved automatically.
       capture_response: true
+    when: "$analyze-intent.output.feasibility == 'true'"
     depends_on: [present-workflow]
 
   # ─────────────────────────────────────────────────────────────────────
-  # 节点 6：本地校验循环（应用审阅意见 → 写盘 → CLI 校验 → 修正）
-  # 完全无 HTTP 依赖，不需要 archon server 在跑
+  # Node 6: AI quality review — runs AFTER user approval so reviewer
+  # feedback is incorporated. Principle-driven, not a fixed checklist:
+  # schema fidelity, reference consistency, bash safety, node type
+  # suitability, Archon convention alignment, and completeness.
+  # ─────────────────────────────────────────────────────────────────────
+  - id: quality-review
+    prompt: |
+      You are an Archon workflow quality reviewer. Read the generated workflow
+      YAML and audit it for correctness, safety, and convention alignment.
+
+      ## Working copy
+
+      `$ARTIFACTS_DIR/distilled-workflow.yaml`
+
+      ## Reviewer feedback (if any)
+
+      $review-approval.output
+
+      ## Review principles
+
+      Check the workflow against each principle below. For every issue found,
+      fix it directly with the Write tool. If the file is already correct,
+      do not modify it.
+
+      ### 1. Schema fidelity
+      Every field on every node must exist in the Archon DAG node spec:
+      - Per-node kind keys (exactly one): `prompt`, `bash`, `script`, `loop`,
+        `approval`, `command`, `cancel`.
+      - Common fields (all nodes): `id` (required), `depends_on` (optional,
+        array), `when` (optional, string), `trigger_rule` (optional).
+      - Prompt-node fields: `prompt`, `model`, `allowed_tools`, `denied_tools`,
+        `output_format` (sub-fields: `type`, `properties`, `required`,
+        `additionalProperties`), `systemPrompt`, `effort`, `thinking`, `tools`.
+      - Bash-node fields: `bash`, `timeout` (optional, integer ms).
+      - Script-node fields: `script`, `runtime` (required, `bun` or `uv`),
+        `deps` (optional, array of strings), `timeout` (optional, integer ms).
+      - Loop-node fields: `prompt`, `until` (required), `max_iterations`
+        (required), `fresh_context` (optional, boolean), `until_bash` (optional).
+      - Approval-node fields: `message` (required), `capture_response` (optional,
+        boolean), `on_reject` (optional). There is NO `options` and NO
+        `output_format` field on approval nodes.
+      If you see an unrecognized key at any level, remove it or replace it
+      with the correct field name.
+
+      ### 2. Reference consistency
+      - Every `$xxx.output` or `$xxx.output.field` variable used in a prompt,
+        bash block, or approval message must have the referenced node id listed
+        in `depends_on` (directly or transitively via another listed node).
+      - Every node id in a `depends_on` list must be a real node in this file.
+      - If a downstream node accesses `$foo.output.bar`, the upstream node
+        must produce structured output containing that field.
+
+      ### 3. Bash safety
+      - Bash blocks must NEVER interpolate raw `$xxx.output` into heredoc
+        bodies, `python3 -c` strings, or `eval`. Use `script` nodes
+        (`runtime: bun` or `runtime: uv`) for structured data manipulation.
+      - When a `$xxx.output` reference appears inside a bash block, verify it
+        is double-quoted so spaces, quotes, or special characters in the output
+        do not break the shell script.
+      - `python3 -c "...$VAR..."` where `$VAR` comes from user input or
+        upstream output is always unsafe. Use `pip show`, a script node, or
+        pass the value through the environment instead.
+      - If `set -e` is active, check every command that could legitimately return
+        non-zero (grep, curl, `gh pr view`, `pip show`, etc.). These MUST use:
+        ```bash
+        set +e
+        command_that_may_fail
+        EXIT_CODE=$?
+        set -e
+        ```
+        Bare `command || true` is an anti-pattern — the exit code is lost and
+        cannot be checked afterward.
+      - If a grep/curl/gh/pip command appears without this guard and the node
+        has `set -e`, flag it as a MUST-FIX.
+
+      ### 4. Node type suitability
+      - If a node needs AI reasoning (research, analysis, judgment) it must be
+        a `prompt` or `loop` node, never `bash` or `script`.
+      - If a node does purely deterministic file I/O or command execution, use
+        `bash` or `script`.
+      - `loop` nodes must declare `until:` and `max_iterations`.
+
+      ### 5. Archon convention alignment
+      - All node `id` values must be kebab-case.
+      - Boolean values in `when:` conditions use single-quoted strings:
+        `'true'` / `'false'`, never bare `true` / `false`.
+      - Workflows must NOT manually create git worktrees (`git worktree add`).
+        Archon provides isolation automatically via the `--branch` CLI flag.
+      - Top-level YAML fields follow this order: `name`, `description`,
+        `interactive`, `provider`, `model`, `nodes`.
+
+      ### 6. Completeness
+      - A `name:` field with a kebab-case name.
+      - A `description:` block with Use when / Triggers / Does / NOT for sections.
+      - At least one `nodes:` entry.
+      - No dangling `when:` conditions referencing non-existent node ids.
+
+      ### 7. Variable syntax correctness (MUST-FIX if violated)
+      The following patterns are NEVER valid in Archon and must be replaced:
+      - `{{ .Args.xxx }}` — Go-template syntax. Use `$ARGUMENTS`.
+      - `${{...}}` — not a valid Archon variable syntax.
+      - `${ARGUMENTS}` or `${nodeId.output}` with braces — Archon's regexes
+        match `$ARGUMENTS` and `$nodeId.output` only (no braces). `${}` is
+        bash syntax; the engine will NOT substitute it.
+      - `os.environ["ARCHON_ARG_ARGUMENTS"]` or `os.environ["ARCHON_NODE_OUTPUT_*"]` —
+        these env var names do not exist. `$ARGUMENTS` and `$nodeId.output` are
+        text-substituted into script bodies.
+      - Any variable reference (`$xxx.output`) where the node id is not listed
+        in `depends_on` — the reference will resolve to empty string.
+      Check EVERY variable reference in the file against the resolution table
+      (in the generate-workflow prompt of this workflow) and fix any mismatch.
+
+      ## After review
+
+      At the end of your response, summarize each principle and whether you
+      found and fixed any issues. If no issues were found, state that the file
+      passed all seven principles.
+    allowed_tools: [Read, Write, Edit, Bash]
+    model: sonnet
+    when: "$analyze-intent.output.feasibility == 'true'"
+    depends_on: [review-approval]
+  # ─────────────────────────────────────────────────────────────────────
+  # Node 7: Local validation loop (write file -> CLI validate -> fix).
+  # Reviewer feedback and quality fixes were already applied by nodes 5-6.
+  # No HTTP dependency; archon server need not be running.
   # ─────────────────────────────────────────────────────────────────────
   - id: validate-and-fix
     loop:
       prompt: |
-        你的任务：校验工作流并把它就位到 `.archon/workflows/`，应用审阅意见，校验通过即完成。
+        Your task: install the workflow to `.archon/workflows/` and validate it.
+        The working copy has already passed quality review — focus on making the
+        CLI validator pass. You are done when validation passes.
 
-        ## 工作副本（用于编辑）
+        ## Working copy (for editing)
 
         `$ARTIFACTS_DIR/distilled-workflow.yaml`
 
-        ## 审阅者意见（如有）
+        ## Steps
 
-        $review-approval.output
-
-        ## 步骤
-
-        1. **应用审阅意见**：如果上方"审阅者意见"非空且包含修改要求，
-           用 Read 工具读取 `$ARTIFACTS_DIR/distilled-workflow.yaml`，
-           用 Write 工具按意见重写文件（保持工作副本同步）。
-           如果意见为空或仅是"Approved"，跳过本步。
-
-        2. **提取工作流名称、写入目标位置**：
+        1. **Extract the workflow name and write to the target location**:
 
            ```bash
            WORKFLOW_NAME=$(grep -E '^name:' "$ARTIFACTS_DIR/distilled-workflow.yaml" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+           # Sanitize: only allow [A-Za-z0-9_-] to prevent command/path injection
+           WORKFLOW_NAME=$(echo "$WORKFLOW_NAME" | tr -cd 'a-zA-Z0-9_-')
            if [ -z "$WORKFLOW_NAME" ]; then
-             echo "错误：无法从 YAML 提取 name 字段"
+             echo "Error: workflow name is empty or contains only invalid characters"
              exit 1
            fi
            mkdir -p .archon/workflows
            cp "$ARTIFACTS_DIR/distilled-workflow.yaml" ".archon/workflows/$WORKFLOW_NAME.yaml"
-           echo "已写入：.archon/workflows/$WORKFLOW_NAME.yaml"
+           echo "Wrote: .archon/workflows/$WORKFLOW_NAME.yaml"
            ```
 
-        3. **本地 CLI 校验**（无需 archon server）：
+        2. **Validate locally via the CLI** (no archon server required):
 
            ```bash
            bun run cli validate workflows "$WORKFLOW_NAME" 2>&1
            VALIDATE_EXIT=$?
-           echo "校验退出码：$VALIDATE_EXIT"
+           echo "Validate exit code: $VALIDATE_EXIT"
            ```
 
-        4. **判断结果**：
-           - 退出码为 0（校验通过）→ 在你的回复**末尾**输出 `VALIDATED`，本次迭代结束
-           - 退出码非 0 → 阅读上方校验错误，用 Edit/Write 工具修改
-             `$ARTIFACTS_DIR/distilled-workflow.yaml`，然后**回到步骤 2 重新写盘并校验**
+        3. **Decide**:
+           - Exit code 0 (validation passed) -> emit `VALIDATED` at the **end**
+             of your reply; the loop terminates.
+           - Non-zero exit code -> read the validation errors, use Edit/Write to
+             update `$ARTIFACTS_DIR/distilled-workflow.yaml`, then **return to
+             step 1** to re-write and re-validate.
 
-        ## 常见错误及修正
+        ## Common errors and fixes
 
-        | 错误关键字 | 修正方向 |
-        |-----------|---------|
-        | `Missing required field 'name'` | 确保 YAML 顶层有 `name: workflow-name` |
-        | `Missing required field 'description'` | 添加 `description: \|` 多行块 |
-        | `Duplicate node id` | 为重复 id 添加数字后缀 |
-        | `depends_on references unknown node` | 修正 id 拼写 |
-        | `Cycle detected` | 移除循环依赖 |
-        | `loop requires until` | 为 loop 节点补 `until:` 字段 |
-        | `script node requires runtime` | 添加 `runtime: bun` 或 `runtime: uv` |
-        | `Node 'X': Unrecognized key` | 检查字段拼写，与上方节点类型参考对照 |
-        | `output_format requires required field` | 在 output_format 内添加 `required: [field1, ...]` |
+        | Error keyword | How to fix |
+        |--------------|-----------|
+        | `Missing required field 'name'` | Ensure top-level `name: workflow-name` exists |
+        | `Missing required field 'description'` | Add a `description: \|` block |
+        | `Duplicate node id` | Append a numeric suffix to the duplicate id |
+        | `depends_on references unknown node` | Fix the id typo |
+        | `Cycle detected` | Remove the circular dependency |
+        | `loop requires until` | Add an `until:` field to the loop node |
+        | `script node requires runtime` | Add `runtime: bun` or `runtime: uv` |
+        | `Node 'X': Unrecognized key` | Check field spelling against the node-type reference above |
+        | `output_format requires required field` | Add `required: [field1, ...]` inside `output_format` |
+      fresh_context: false
       until: VALIDATED
-      max_iterations: 3
-    depends_on: [review-approval]
-
+      max_iterations: 2
+    when: "$analyze-intent.output.feasibility == 'true'"
+    depends_on: [quality-review]
   # ─────────────────────────────────────────────────────────────────────
-  # 节点 7：最终报告（写入工作已在 validate-and-fix 中完成）
+  # Node 8: Final report (the write itself already happened in validate-and-fix).
   # ─────────────────────────────────────────────────────────────────────
   - id: save-workflow
     bash: |
       set -e
 
       WORKFLOW_NAME=$(grep -E '^name:' "$ARTIFACTS_DIR/distilled-workflow.yaml" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
-      WORKFLOW_PATH=".archon/workflows/$WORKFLOW_NAME.yaml"
+      # Sanitize: only allow [A-Za-z0-9_-] to prevent command/path injection
+      WORKFLOW_NAME=$(echo "$WORKFLOW_NAME" | tr -cd 'a-zA-Z0-9_-')
 
       if [ -z "$WORKFLOW_NAME" ]; then
-        echo "错误：无法读取工作流名称"
+        echo "Error: workflow name is empty or contains only invalid characters"
         exit 1
       fi
+
+      WORKFLOW_PATH=".archon/workflows/$WORKFLOW_NAME.yaml"
 
       if [ ! -f "$WORKFLOW_PATH" ]; then
-        echo "错误：未在 $WORKFLOW_PATH 找到已保存的工作流"
+        echo "Error: saved workflow not found at $WORKFLOW_PATH"
         exit 1
       fi
 
-      echo "✓ 工作流已沉淀完成"
+      echo "Workflow distilled successfully."
       echo ""
-      echo "  名称：$WORKFLOW_NAME"
-      echo "  位置：$WORKFLOW_PATH"
+      echo "  Name:     $WORKFLOW_NAME"
+      echo "  Location: $WORKFLOW_PATH"
       echo ""
-      echo "  触发方式：archon workflow run $WORKFLOW_NAME"
-      echo "  校验方式：bun run cli validate workflows $WORKFLOW_NAME"
+      echo "  Run:      archon workflow run $WORKFLOW_NAME"
+      echo "  Validate: bun run cli validate workflows $WORKFLOW_NAME"
+    when: "$analyze-intent.output.feasibility == 'true'"
     depends_on: [validate-and-fix]
